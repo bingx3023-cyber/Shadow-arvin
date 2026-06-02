@@ -1,982 +1,389 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
 
-repo="${SKIRK_REPO:-ShahabSL/Skirk}"
-version="${SKIRK_VERSION:-latest}"
-asset_base="${SKIRK_ASSET_BASE:-}"
-require_release_asset="${SKIRK_REQUIRE_RELEASE_ASSET:-}"
-dev_install=""
-server_setup="${SKIRK_SERVER_SETUP:-}"
-adc_path="${SKIRK_ADC:-}"
-setup_out="${SKIRK_SETUP_OUT:-skirk-kit}"
-install_systemd="${SKIRK_INSTALL_SYSTEMD:-}"
-service_name="${SKIRK_SERVICE_NAME:-skirk-exit}"
-service_user="${SKIRK_SERVICE_USER:-}"
-exit_proxy="${SKIRK_EXIT_PROXY:-}"
-install_wireproxy="${SKIRK_INSTALL_WIREPROXY:-}"
-wireproxy_bind="${SKIRK_WIREPROXY_BIND:-127.0.0.1:40000}"
-wireproxy_dir="${SKIRK_WIREPROXY_DIR:-/etc/wireproxy}"
-wireproxy_bin="${SKIRK_WIREPROXY_BIN:-/usr/local/bin/wireproxy}"
-wireproxy_user="${SKIRK_WIREPROXY_USER:-skirk-wireproxy}"
-wireproxy_version="${SKIRK_WIREPROXY_VERSION:-v1.1.2}"
-wgcf_bin="${SKIRK_WGCF_BIN:-/usr/local/bin/wgcf}"
-wgcf_version="${SKIRK_WGCF_VERSION:-v2.2.30}"
-wireproxy_only="${SKIRK_WIREPROXY_ONLY:-}"
+# =============================================
+# Shadow SSH v2.0 - FINAL WORKING EDITION
+# Auto: IP if no domain, Domain if set
+# =============================================
 
-default_install_dir() {
-  if [ -n "${SKIRK_INSTALL_DIR:-}" ]; then
-    printf '%s\n' "$SKIRK_INSTALL_DIR"
-    return 0
-  fi
-  if [ "$(id -u)" -eq 0 ]; then
-    printf '%s\n' "/usr/local/bin"
-    return 0
-  fi
-  printf '%s\n' "$HOME/.local/bin"
-}
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-install_dir="$(default_install_dir)"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
+echo -e "${GREEN}   Shadow SSH - FINAL WORKING EDITION${NC}"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
 
-usage() {
-  cat <<EOF
-Usage: install.sh [--version VERSION] [--wireproxy-only] [--dev-install] [uninstall|--uninstall]
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}❌ Must be root!${NC}" 
+   exit 1
+fi
 
-Environment:
-  SKIRK_VERSION=latest|vX.Y.Z  Select the Skirk release.
-  SKIRK_INSTALL_DIR=PATH       Install directory. Default: /usr/local/bin for root,
-                                  \$HOME/.local/bin for non-root users.
-  SKIRK_REQUIRE_RELEASE_ASSET=1 Fail instead of building from source if release assets are unavailable.
-                                  Defaults to 1 for explicit vX.Y.Z versions.
-  SKIRK_INSTALL_WIREPROXY=1    Install Skirk-managed WARP wireproxy.
-  --dev-install                Allow custom SKIRK_REPO/SKIRK_ASSET_BASE and source refs.
-EOF
-}
+# پاکسازی اولیه
+pkill -9 shadow 2>/dev/null
+rm -f /usr/local/bin/shadow /etc/shadow-*.conf
 
-validate_version() {
-  value="$1"
-  case "$value" in
-    ""|-*|*/*|*..*|*[!A-Za-z0-9._-]*)
-      echo "error: unsafe version/ref: $value" >&2
-      exit 1
-      ;;
-  esac
-  case "$value" in
-    v*)
-      if ! is_release_version "$value"; then
-        echo "error: release versions must use vX.Y.Z format: $value" >&2
-        exit 1
-      fi
-      ;;
-    latest) ;;
-    *)
-      if [ "$dev_install" != "1" ]; then
-        echo "error: version must be latest or vX.Y.Z (use --dev-install for source refs)" >&2
-        exit 1
-      fi
-      ;;
-  esac
-}
+# رفع مشکلات
+dpkg --configure -a 2>/dev/null
+apt-get install -f -y 2>/dev/null
 
-is_release_version() {
-  value="$1"
-  case "$value" in
-    v*.*.*) ;;
-    *) return 1 ;;
-  esac
-  rest="${value#v}"
-  old_ifs="$IFS"
-  IFS=.
-  # shellcheck disable=SC2086
-  set -- $rest
-  IFS="$old_ifs"
-  [ "$#" -eq 3 ] || return 1
-  for part in "$@"; do
-    case "$part" in
-      ""|*[!0-9]*) return 1 ;;
-    esac
-  done
-  return 0
-}
+# نصب پیش‌نیازها
+echo -e "${YELLOW}📦 Installing dependencies...${NC}"
+apt update -y
+apt install -y curl wget coreutils openssh-server
 
-parse_args() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --version)
-        [ "$#" -ge 2 ] || { echo "error: --version needs a value" >&2; exit 1; }
-        version="$2"
-        shift 2
-        ;;
-      --version=*)
-        version="${1#--version=}"
-        shift
-        ;;
-      --wireproxy-only)
-        wireproxy_only=1
-        install_wireproxy=1
-        shift
-        ;;
-      --dev-install)
-        dev_install=1
-        shift
-        ;;
-      --help|-h)
-        usage
-        exit 0
-        ;;
-      *)
-        break
-        ;;
-    esac
-  done
-  validate_version "$version"
-  set -- "$@"
-  parsed_args="$*"
-}
+# حذف پورت 8388
+sed -i '/Port 8388/d' /etc/ssh/sshd_config 2>/dev/null
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
 
-normalize_service_unit() {
-  name="$1"
-  case "$name" in
-    ""|*/*|*..*|*" "*|*"'"*|*'"'*|*\\*)
-      echo "error: unsafe service name: $name" >&2
-      exit 1
-      ;;
-  esac
-  case "$name" in
-    *.service) printf '%s\n' "$1" ;;
-    *) printf '%s.service\n' "$1" ;;
-  esac
-}
+# ایجاد فایل‌ها
+touch /etc/shadow-users.conf
+echo "" > /etc/shadow-domain.conf
+echo "0" > /etc/shadow-fec.conf
 
-is_skirk_unit_file() {
-  unit_path="$1"
-  [ -f "$unit_path" ] || return 1
-  grep -Eq 'Managed by Skirk|Wireproxy WARP SOCKS proxy for Skirk exit|ExecStart=.* serve-exit .* --config ' "$unit_path"
-}
+# گرفتن IP سرور
+SERVER_IP=$(curl -s -4 ifconfig.me 2>/dev/null)
+if [ -z "$SERVER_IP" ]; then
+    SERVER_IP=$(curl -s -4 icanhazip.com 2>/dev/null)
+fi
+if [ -z "$SERVER_IP" ]; then
+    SERVER_IP="157.10.52.88"
+fi
 
-is_skirk_dropin_file() {
-  dropin_path="$1"
-  [ -f "$dropin_path" ] || return 1
-  if run_root grep -Fq "Managed by Skirk" "$dropin_path"; then
-    return 0
-  fi
-  cleaned="$(run_root sed '/^[[:space:]]*$/d' "$dropin_path")"
-  [ "$cleaned" = "[Unit]
-After=wireproxy.service
-Wants=wireproxy.service" ]
-}
+# =============================================
+# پنل نهایی با تابع get_server درست
+# =============================================
+cat > /usr/local/bin/shadow << 'INNEREOF'
+#!/bin/bash
 
-remove_skirk_wireproxy_dropin() {
-  dropin_dir="$1"
-  dropin_path="$dropin_dir/10-wireproxy.conf"
-  if [ -e "$dropin_path" ]; then
-    if ! is_skirk_dropin_file "$dropin_path"; then
-      echo "error: refusing to remove non-Skirk drop-in: $dropin_path" >&2
-      exit 1
-    fi
-    run_root rm -f "$dropin_path"
-  fi
-  run_root rmdir "$dropin_dir" 2>/dev/null || true
-}
+CONFIG_FILE="/etc/shadow-users.conf"
+DOMAIN_FILE="/etc/shadow-domain.conf"
+FEC_FILE="/etc/shadow-fec.conf"
 
-need() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "error: missing required command: $1" >&2
-    exit 1
-  }
-}
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-is_skirk_binary_path() {
-  candidate="$1"
-  [ -x "$candidate" ] || return 1
-  output="$("$candidate" version 2>/dev/null || true)"
-  case "$output" in
-    "skirk "*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-install_global_command_shim() {
-  if [ "$(id -u)" -ne 0 ]; then
-    return 1
-  fi
-  installed_bin="$install_dir/skirk"
-  command_path="/usr/local/bin/skirk"
-  [ "$installed_bin" != "$command_path" ] || return 1
-
-  mkdir -p /usr/local/bin
-  if [ -e "$command_path" ] || [ -L "$command_path" ]; then
-    if [ -L "$command_path" ]; then
-      rm -f "$command_path"
-    elif is_skirk_binary_path "$command_path"; then
-      rm -f "$command_path"
-    else
-      echo "Warning: $command_path exists and is not a Skirk binary; leaving it unchanged." >&2
-      return 1
-    fi
-  fi
-  ln -s "$installed_bin" "$command_path"
-  echo "Command available: $command_path -> $installed_bin"
-  return 0
-}
-
-remove_global_command_shim() {
-  installed_bin="$1"
-  command_path="/usr/local/bin/skirk"
-  [ "$installed_bin" != "$command_path" ] || return 0
-  [ -L "$command_path" ] || return 0
-  link_target="$(readlink "$command_path" 2>/dev/null || true)"
-  if [ "$link_target" = "$installed_bin" ]; then
-    run_root rm -f "$command_path"
-    echo "Removed command shim: $command_path"
-  fi
-}
-
-path_profile_expr() {
-  case "$install_dir" in
-    "$HOME"/*) printf '%s/%s\n' "\$HOME" "${install_dir#"$HOME"/}" ;;
-    *) printf '%s\n' "$install_dir" ;;
-  esac
-}
-
-append_path_to_profile() {
-  profile="$1"
-  path_expr="$2"
-  [ -n "$profile" ] || return 0
-  [ -f "$profile" ] || return 0
-  if grep -Fq "# Added by Skirk installer" "$profile" || grep -Fq "$path_expr" "$profile"; then
-    return 0
-  fi
-  cat >>"$profile" <<EOF
-
-# Added by Skirk installer
-case ":\$PATH:" in
-  *":$path_expr:"*) ;;
-  *) export PATH="$path_expr:\$PATH" ;;
-esac
-EOF
-  echo "Added Skirk PATH entry to $profile"
-}
-
-persist_user_path() {
-  [ -n "${HOME:-}" ] || return 0
-  case ":$PATH:" in
-    *":$install_dir:"*) return 0 ;;
-  esac
-  case "$install_dir" in
-    "$HOME"/*|/*) ;;
-    *) return 0 ;;
-  esac
-  path_expr="$(path_profile_expr)"
-  case "$path_expr" in
-    *"'"*) return 0 ;;
-  esac
-
-  profile="$HOME/.profile"
-  if [ ! -e "$profile" ]; then
-    touch "$profile" 2>/dev/null || true
-  fi
-  append_path_to_profile "$profile" "$path_expr"
-  append_path_to_profile "$HOME/.bashrc" "$path_expr"
-  append_path_to_profile "$HOME/.zprofile" "$path_expr"
-  append_path_to_profile "$HOME/.zshrc" "$path_expr"
-}
-
-ensure_skirk_command() {
-  if install_global_command_shim; then
-    return 0
-  fi
-  persist_user_path
-  case ":$PATH:" in
-    *":$install_dir:"*) echo "Command available: skirk" ;;
-    *) echo "Open a new shell or run: export PATH=\"$install_dir:\$PATH\"" ;;
-  esac
-}
-
-detect_platform() {
-  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-  arch="$(uname -m)"
-  case "$os" in
-    linux) os="linux" ;;
-    *) echo "error: this installer currently supports Linux exit/client machines only (got $os)" >&2; exit 1 ;;
-  esac
-  case "$arch" in
-    x86_64|amd64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
-    *) echo "error: unsupported CPU architecture: $arch" >&2; exit 1 ;;
-  esac
-  echo "$os-$arch"
-}
-
-download() {
-  url="$1"
-  out="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$out"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$out" "$url"
-  else
-    echo "error: install curl or wget" >&2
-    exit 1
-  fi
-}
-
-run_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
-  else
-    echo "error: this step needs root or sudo: $*" >&2
-    exit 1
-  fi
-}
-
-validate_wireproxy_bind() {
-  case "$wireproxy_bind" in
-    127.0.0.1:*) ;;
-    *)
-      echo "error: SKIRK_WIREPROXY_BIND must bind loopback only, for example 127.0.0.1:40000" >&2
-      exit 1
-      ;;
-  esac
-  case "$wireproxy_bind" in
-    *[!0123456789.:]*|*:*:*)
-      echo "error: SKIRK_WIREPROXY_BIND must be exactly 127.0.0.1:PORT" >&2
-      exit 1
-      ;;
-  esac
-  port="${wireproxy_bind#127.0.0.1:}"
-  case "$port" in
-    ""|*[!0-9]*)
-      echo "error: SKIRK_WIREPROXY_BIND port is invalid: $wireproxy_bind" >&2
-      exit 1
-      ;;
-  esac
-  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-    echo "error: SKIRK_WIREPROXY_BIND port is out of range: $wireproxy_bind" >&2
-    exit 1
-  fi
-}
-
-validate_wireproxy_user() {
-  if [ "$wireproxy_user" != "skirk-wireproxy" ]; then
-    echo "error: managed WARP wireproxy must run as skirk-wireproxy" >&2
-    exit 1
-  fi
-}
-
-require_systemd_for_wireproxy() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "error: systemd is required to install and start WARP wireproxy" >&2
-    exit 1
-  fi
-  if ! systemctl show --property=SystemState >/dev/null 2>&1; then
-    echo "error: systemd is not usable on this machine" >&2
-    exit 1
-  fi
-}
-
-preflight_wireproxy_install() {
-  if [ "$install_wireproxy" != "1" ]; then
-    return 0
-  fi
-  validate_wireproxy_bind
-  validate_wireproxy_user
-  require_systemd_for_wireproxy
-  need ss
-  if [ "$wireproxy_dir" != "/etc/wireproxy" ] || [ "$wireproxy_bin" != "/usr/local/bin/wireproxy" ] || [ "$wgcf_bin" != "/usr/local/bin/wgcf" ]; then
-    echo "error: managed WARP wireproxy uses fixed paths under /etc/wireproxy and /usr/local/bin" >&2
-    exit 1
-  fi
-  if [ -L "$wireproxy_dir" ] || [ -L "$wireproxy_bin" ] || [ -L "$wgcf_bin" ]; then
-    echo "error: refusing to use symlinked WARP wireproxy paths" >&2
-    exit 1
-  fi
-  wireproxy_unit="/etc/systemd/system/wireproxy.service"
-  if [ -e "$wireproxy_unit" ] && ! is_skirk_unit_file "$wireproxy_unit"; then
-    echo "error: refusing to overwrite non-Skirk $wireproxy_unit" >&2
-    exit 1
-  fi
-  manifest_ok=0
-  if has_skirk_wireproxy_manifest; then
-    verify_skirk_wireproxy_manifest
-    manifest_ok=1
-  fi
-  if [ -e "$wireproxy_dir" ] && [ "$manifest_ok" != "1" ] && ! is_legacy_skirk_wireproxy_install; then
-    echo "error: refusing to overwrite non-Skirk $wireproxy_dir" >&2
-    exit 1
-  fi
-  if [ -e "$wireproxy_bin" ] && [ "$manifest_ok" != "1" ] && ! is_legacy_skirk_wireproxy_install; then
-    echo "error: refusing to overwrite existing $wireproxy_bin without Skirk manifest" >&2
-    exit 1
-  fi
-  if [ -e "$wgcf_bin" ] && [ "$manifest_ok" != "1" ] && ! is_legacy_skirk_wireproxy_install; then
-    echo "error: refusing to overwrite existing $wgcf_bin without Skirk manifest" >&2
-    exit 1
-  fi
-  port="${wireproxy_bind#127.0.0.1:}"
-  if run_root ss -ltnp 2>/dev/null | awk -v port=":$port" '$4 ~ port "$" && $0 !~ /wireproxy/ { found = 1 } END { exit !found }'; then
-    echo "error: $wireproxy_bind is already used by a non-wireproxy process" >&2
-    exit 1
-  fi
-}
-
-wait_wireproxy_ready() {
-  port="${wireproxy_bind#127.0.0.1:}"
-  i=0
-  while [ "$i" -lt 30 ]; do
-    if systemctl is-active --quiet wireproxy.service; then
-      main_pid="$(systemctl show -p MainPID --value wireproxy.service 2>/dev/null || true)"
-      if [ -n "$main_pid" ] && [ "$main_pid" != "0" ]; then
-        if run_root ss -ltnp 2>/dev/null | awk -v want="127.0.0.1:$port" -v pid="$main_pid" '$4 == want && $0 ~ ("pid=" pid "([^0-9]|$)") { found = 1 } END { exit !found }'; then
-          return 0
+# تابع مطمئن برای گرفتن آدرس سرور
+get_server() {
+    # اول چک کن دامنه تنظیم شده؟
+    if [ -f "$DOMAIN_FILE" ]; then
+        local domain=$(cat "$DOMAIN_FILE" 2>/dev/null | head -1)
+        if [ -n "$domain" ] && [ "$domain" != "" ]; then
+            echo "$domain"
+            return
         fi
-      fi
     fi
-    sleep 1
-    i=$((i + 1))
-  done
-  echo "error: wireproxy.service started but $wireproxy_bind did not become ready" >&2
-  systemctl status wireproxy.service --no-pager >&2 || true
-  exit 1
-}
-
-file_sha256() {
-  path="$1"
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$path" | awk '{print $1}'
-  elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$path" | awk '{print $1}'
-  else
-    echo "error: missing required command: sha256sum or shasum" >&2
-    exit 1
-  fi
-}
-
-root_file_exists() {
-  run_root test -f "$1" >/dev/null 2>&1
-}
-
-has_skirk_wireproxy_manifest() {
-  root_file_exists "$wireproxy_dir/skirk-managed.manifest"
-}
-
-wireproxy_manifest_value() {
-  key="$1"
-  # shellcheck disable=SC2016 # awk variables are expanded by awk, not the shell.
-  run_root awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; found = 1; exit } END { exit found ? 0 : 1 }' "$wireproxy_dir/skirk-managed.manifest"
-}
-
-verify_manifest_checksum() {
-  path="$1"
-  want="$2"
-  if [ -z "$want" ]; then
-    echo "error: refusing to trust WARP manifest with empty checksum for $path" >&2
-    exit 1
-  fi
-  if [ -e "$path" ]; then
-    got="$(file_sha256 "$path")"
-    if [ "$got" != "$want" ]; then
-      echo "error: refusing to overwrite $path: WARP manifest checksum mismatch" >&2
-      exit 1
+    
+    # دامنه نداریم -> برو سراغ IP
+    local ip=$(curl -s -4 ifconfig.me 2>/dev/null)
+    if [ -n "$ip" ] && [ "$ip" != "" ]; then
+        echo "$ip"
+        return
     fi
-  fi
+    
+    # آخرین راه: IP هاردکد شده
+    echo "SERVER_IP_PLACEHOLDER"
 }
 
-verify_skirk_wireproxy_manifest() {
-  manifest="$wireproxy_dir/skirk-managed.manifest"
-  root_file_exists "$manifest" || {
-    echo "error: missing WARP ownership manifest: $manifest" >&2
-    exit 1
-  }
-  run_root grep -Fq "Managed by Skirk" "$manifest" || {
-    echo "error: refusing to trust WARP manifest without Skirk marker: $manifest" >&2
-    exit 1
-  }
-  m_dir="$(wireproxy_manifest_value config_dir || true)"
-  m_wireproxy="$(wireproxy_manifest_value wireproxy_bin || true)"
-  m_wireproxy_sha="$(wireproxy_manifest_value wireproxy_sha256 || true)"
-  m_wgcf="$(wireproxy_manifest_value wgcf_bin || true)"
-  m_wgcf_sha="$(wireproxy_manifest_value wgcf_sha256 || true)"
-  m_service="$(wireproxy_manifest_value service || true)"
-  m_user="$(wireproxy_manifest_value user || true)"
-  if [ "$m_dir" != "$wireproxy_dir" ] || [ "$m_wireproxy" != "$wireproxy_bin" ] || [ "$m_wgcf" != "$wgcf_bin" ] || [ "$m_service" != "/etc/systemd/system/wireproxy.service" ] || [ "$m_user" != "$wireproxy_user" ]; then
-    echo "error: refusing to trust WARP manifest with unexpected paths or user" >&2
-    exit 1
-  fi
-  verify_manifest_checksum "$wireproxy_bin" "$m_wireproxy_sha"
-  verify_manifest_checksum "$wgcf_bin" "$m_wgcf_sha"
-}
-
-is_legacy_skirk_wireproxy_install() {
-  wireproxy_unit="/etc/systemd/system/wireproxy.service"
-  [ -e "$wireproxy_unit" ] || return 1
-  is_skirk_unit_file "$wireproxy_unit" || return 1
-  root_file_exists "$wireproxy_dir/wireproxy.conf" || return 1
-  run_root grep -Fq "WGConfig = $wireproxy_dir/wgcf-profile.conf" "$wireproxy_dir/wireproxy.conf"
-}
-
-ensure_wireproxy_user() {
-  if command -v getent >/dev/null 2>&1 && getent passwd "$wireproxy_user" >/dev/null 2>&1; then
-    user_entry="$(getent passwd "$wireproxy_user")"
-    uid="$(printf '%s\n' "$user_entry" | awk -F: '{print $3}')"
-    shell="$(printf '%s\n' "$user_entry" | awk -F: '{print $7}')"
-    if [ "$uid" -eq 0 ]; then
-      echo "error: refusing to run WARP wireproxy as uid 0" >&2
-      exit 1
-    fi
-    case "$shell" in
-      */nologin|*/false) ;;
-      *)
-        echo "error: refusing to reuse existing $wireproxy_user account with login shell $shell" >&2
-        exit 1
-        ;;
-    esac
-    return 0
-  fi
-  command -v useradd >/dev/null 2>&1 || {
-    echo "error: useradd is required to create $wireproxy_user" >&2
-    exit 1
-  }
-  nologin_shell="/usr/sbin/nologin"
-  [ -x "$nologin_shell" ] || nologin_shell="/sbin/nologin"
-  [ -x "$nologin_shell" ] || nologin_shell="/bin/false"
-  run_root useradd --system --no-create-home --shell "$nologin_shell" "$wireproxy_user"
-}
-
-uninstall_skirk() {
-  remove_service=1
-  remove_binary=1
-  dry_run=0
-  for arg in "$@"; do
-    case "$arg" in
-      --service=false) remove_service=0 ;;
-      --binary=false) remove_binary=0 ;;
-      --dry-run) dry_run=1 ;;
-    esac
-  done
-  service_unit="$(normalize_service_unit "$service_name")"
-  skirk_bin="$install_dir/skirk"
-  if [ -x "$skirk_bin" ]; then
-    "$skirk_bin" uninstall --yes --name "$service_name" --bin "$skirk_bin" "$@"
-    return 0
-  fi
-
-  echo "Skirk binary was not found at $skirk_bin; running fallback uninstall."
-  if command -v systemctl >/dev/null 2>&1 && [ "$remove_service" = "1" ]; then
-    unit_path="/etc/systemd/system/$service_unit"
-    if [ -e "$unit_path" ]; then
-      if ! is_skirk_unit_file "$unit_path"; then
-        echo "error: refusing to remove $unit_path because it is not managed by Skirk" >&2
-        exit 1
-      fi
-      if [ "$dry_run" = "1" ]; then
-        echo "Would remove systemd service: $service_unit"
-      else
-        run_root systemctl disable --now "$service_unit" 2>/dev/null || true
-        run_root rm -f "$unit_path"
-        run_root systemctl daemon-reload || true
-        echo "Removed systemd service: $service_unit"
-      fi
+get_fec_status() {
+    local ratio=$(cat "$FEC_FILE" 2>/dev/null)
+    if [ -z "$ratio" ] || [ "$ratio" == "0" ]; then
+        echo -e "${RED}Disabled${NC}"
     else
-      echo "Systemd service file already absent: $unit_path"
+        echo -e "${GREEN}Active (${ratio}:10)${NC}"
     fi
-  fi
-  if [ "$remove_binary" = "1" ]; then
-    if [ "$dry_run" = "1" ]; then
-      echo "Would remove installed binary: $skirk_bin"
+}
+
+generate_npvt_config() {
+    local username=$1
+    local password=$2
+    local server=$(get_server)
+    
+    # JSON ساده و درست
+    printf '{
+  "sshConfigType": "SSH-Direct",
+  "remarks": "%s-fec",
+  "sshHost": "%s",
+  "sshPort": 22,
+  "sshUsername": "%s",
+  "sshPassword": "%s",
+  "udpgwTransparentDNS": true
+}' "$username" "$server" "$username" "$password"
+}
+
+show_menu() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}       🚀 SHADOW SSH - FINAL EDITION${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "   ${YELLOW}Server:${NC} $(get_server):22"
+    echo -e "   ${YELLOW}FEC:${NC} $(get_fec_status)"
+    echo -e "   ${RED}Port 8388:${NC} ${RED}REMOVED${NC}"
+    echo -e "${BLUE}────────────────────────────────────────────${NC}"
+    echo -e "   ${YELLOW}1${NC}) Create User"
+    echo -e "   ${YELLOW}2${NC}) List Users"
+    echo -e "   ${YELLOW}3${NC}) Show Config"
+    echo -e "   ${YELLOW}4${NC}) Delete User"
+    echo -e "   ${GREEN}5${NC}) Set Domain"
+    echo -e "   ${YELLOW}6${NC}) Remove Domain"
+    echo -e "   ${CYAN}7${NC}) Set FEC Ratio (2-100)"
+    echo -e "   ${RED}8${NC}) Disable FEC"
+    echo -e "   ${YELLOW}9${NC}) Exit"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+}
+
+create_user() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}✨ CREATE USER${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    
+    echo -n "👤 Username: "
+    read username
+    echo -n "🔑 Password: "
+    read password
+    echo -n "📊 Traffic GB: "
+    read traffic
+    echo -n "📅 Days: "
+    read days
+
+    if [ -z "$username" ] || [ -z "$password" ] || [ -z "$traffic" ] || [ -z "$days" ]; then
+        echo -e "\n${RED}❌ All fields required!${NC}"
+        sleep 2
+        return
+    fi
+
+    if ! [[ "$traffic" =~ ^[0-9]+$ ]] || ! [[ "$days" =~ ^[0-9]+$ ]]; then
+        echo -e "\n${RED}❌ Traffic and Days must be numbers!${NC}"
+        sleep 2
+        return
+    fi
+
+    expiry=$(date -d "+$days days" +%s)
+    echo "$username:$password:$traffic:$expiry:0" >> "$CONFIG_FILE"
+    useradd -M -s /bin/false "$username" 2>/dev/null
+    echo "$username:$password" | chpasswd 2>/dev/null
+    
+    local json_config=$(generate_npvt_config "$username" "$password")
+    local config_b64=$(echo -n "$json_config" | base64 -w 0)
+    local npvt_config="npvt-ssh://${config_b64}"
+    
+    clear
+    echo -e "${GREEN}✅ USER CREATED!${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}📱 NPVT VPN CONFIG (Copy this):${NC}"
+    echo -e "${BLUE}────────────────────────────────────────────${NC}"
+    echo -e "${GREEN}${npvt_config}${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    
+    # نمایش اطلاعات برای اطمینان
+    echo -e "\n${YELLOW}📋 Connection Details:${NC}"
+    echo -e "   Server: $(get_server)"
+    echo -e "   Port: 22"
+    echo -e "   Username: $username"
+    echo -e "   Password: $password"
+    
+    echo -e "\n${YELLOW}Press Enter...${NC}"
+    read dummy
+}
+
+list_users() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}📋 USERS LIST${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    
+    if [ ! -s "$CONFIG_FILE" ]; then
+        echo -e "${RED}❌ No users found${NC}"
     else
-      rm -f "$skirk_bin"
-      echo "Removed installed binary: $skirk_bin"
-      remove_global_command_shim "$skirk_bin"
+        printf "   %-15s %-10s %-10s\n" "USERNAME" "EXPIRE" "TRAFFIC"
+        echo -e "${BLUE}────────────────────────────────────────────${NC}"
+        
+        local current_time=$(date +%s)
+        while IFS=: read -r user pass traffic expiry used; do
+            local remaining_days=$(( (expiry - current_time) / 86400 ))
+            if [ $remaining_days -lt 0 ]; then
+                printf "   ${RED}%-15s EXPIRED   %-10s${NC}\n" "$user" "${traffic}GB"
+            else
+                printf "   ${GREEN}%-15s${NC} %-10s %-10s\n" "$user" "${remaining_days}d" "${traffic}GB"
+            fi
+        done < "$CONFIG_FILE"
     fi
-  fi
-  echo "Skirk uninstall complete."
+    
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "\n${YELLOW}Press Enter...${NC}"
+    read dummy
 }
 
-install_from_release() {
-  platform="$1"
-  tmp="$2"
-  asset="skirk-$platform.tar.gz"
-  if [ -n "$asset_base" ]; then
-    url="$asset_base/$asset"
-  elif [ "$version" = "latest" ]; then
-    url="https://github.com/$repo/releases/latest/download/$asset"
-  else
-    url="https://github.com/$repo/releases/download/$version/$asset"
-  fi
-
-  echo "Downloading $url"
-  if ! download "$url" "$tmp/$asset"; then
-    return 1
-  fi
-  tar -xzf "$tmp/$asset" -C "$tmp"
-  if [ ! -x "$tmp/skirk" ]; then
-    echo "error: release archive did not contain executable skirk" >&2
-    return 1
-  fi
-  verify_candidate_version "$tmp/skirk"
-  mkdir -p "$install_dir"
-  install_tmp="$install_dir/.skirk.tmp.$$"
-  cp "$tmp/skirk" "$install_tmp"
-  chmod 0755 "$install_tmp"
-  mv "$install_tmp" "$install_dir/skirk"
-  verify_candidate_version "$install_dir/skirk"
+show_config() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}📄 SHOW CONFIG${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    
+    echo -n "👤 Username: "
+    read username
+    
+    if ! grep -q "^$username:" "$CONFIG_FILE" 2>/dev/null; then
+        echo -e "\n${RED}❌ User not found!${NC}"
+        sleep 2
+        return
+    fi
+    
+    local password=$(grep "^$username:" "$CONFIG_FILE" | cut -d: -f2)
+    local json_config=$(generate_npvt_config "$username" "$password")
+    local config_b64=$(echo -n "$json_config" | base64 -w 0)
+    local npvt_config="npvt-ssh://${config_b64}"
+    
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}📱 NPVT CONFIG for ${username}:${NC}"
+    echo -e "${BLUE}────────────────────────────────────────────${NC}"
+    echo -e "${GREEN}${npvt_config}${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "\n${YELLOW}Press Enter...${NC}"
+    read dummy
 }
 
-install_warp_wireproxy() {
-  if [ "$install_wireproxy" != "1" ]; then
-    return 0
-  fi
-  need tar
+delete_user() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}🗑️ DELETE USER${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    
+    echo -n "👤 Username: "
+    read username
+    
+    sed -i "/^$username:/d" "$CONFIG_FILE" 2>/dev/null
+    userdel -r "$username" 2>/dev/null
+    
+    echo -e "\n${GREEN}✅ Deleted${NC}"
+    sleep 2
+}
 
-  case "$platform" in
-    linux-amd64|linux-arm64) ;;
-    *) echo "error: WARP wireproxy installer supports linux-amd64 and linux-arm64 only (got $platform)" >&2; exit 1 ;;
-  esac
-  preflight_wireproxy_install
+set_domain() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}🌐 SET DOMAIN${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -n "👉 Domain: "
+    read domain
+    
+    if [ -n "$domain" ]; then
+        echo "$domain" > "$DOMAIN_FILE"
+        echo -e "\n${GREEN}✅ Domain set to: $domain${NC}"
+    else
+        echo -e "\n${RED}❌ Invalid${NC}"
+    fi
+    sleep 2
+}
 
-  if [ -z "$exit_proxy" ]; then
-    exit_proxy="socks5h://$wireproxy_bind"
-  fi
+remove_domain() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}🔙 REMOVE DOMAIN${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo "" > "$DOMAIN_FILE"
+    echo -e "${GREEN}✅ Domain removed. Back to IP mode.${NC}"
+    sleep 2
+}
 
-  tmp_warp="$tmp/warp"
-  mkdir -p "$tmp_warp"
-  wgcf_arch="${platform#linux-}"
-  wgcf_no_v="${wgcf_version#v}"
-  wgcf_url="https://github.com/ViRb3/wgcf/releases/download/$wgcf_version/wgcf_${wgcf_no_v}_linux_${wgcf_arch}"
-  wireproxy_url="https://github.com/windtf/wireproxy/releases/download/$wireproxy_version/wireproxy_linux_${wgcf_arch}.tar.gz"
-
-  echo "Installing WARP wireproxy..."
-  ensure_wireproxy_user
-  download "$wgcf_url" "$tmp_warp/wgcf"
-  chmod 0755 "$tmp_warp/wgcf"
-
-  download "$wireproxy_url" "$tmp_warp/wireproxy.tar.gz"
-  mkdir "$tmp_warp/wireproxy"
-  tar -xzf "$tmp_warp/wireproxy.tar.gz" -C "$tmp_warp/wireproxy"
-  wireproxy_src="$(find "$tmp_warp/wireproxy" -type f -name wireproxy -perm -111 | head -n 1)"
-  if [ -z "$wireproxy_src" ]; then
-    echo "error: wireproxy release archive did not contain executable wireproxy" >&2
-    exit 1
-  fi
-
-  run_root mkdir -p "$wireproxy_dir"
-  run_root chmod 0711 "$wireproxy_dir"
-  if ! root_file_exists "$wireproxy_dir/wgcf-account.toml" || [ "${SKIRK_RESET_WARP:-}" = "1" ]; then
-    (
-      cd "$tmp_warp"
-      if [ "${SKIRK_ACCEPT_WARP_TOS:-}" = "1" ]; then
-        printf "yes\n" | "$tmp_warp/wgcf" register
-      else
-        "$tmp_warp/wgcf" register
-      fi
-      "$tmp_warp/wgcf" generate --profile "$tmp_warp/wgcf-profile.conf"
-    )
-    run_root install -m 0600 "$tmp_warp/wgcf-account.toml" "$wireproxy_dir/wgcf-account.toml"
-    run_root install -m 0600 "$tmp_warp/wgcf-profile.conf" "$wireproxy_dir/wgcf-profile.conf"
-  elif ! root_file_exists "$wireproxy_dir/wgcf-profile.conf"; then
-    run_root cp "$wireproxy_dir/wgcf-account.toml" "$tmp_warp/wgcf-account.toml"
-    run_root chown "$(id -u):$(id -g)" "$tmp_warp/wgcf-account.toml"
-    (
-      cd "$tmp_warp"
-      "$tmp_warp/wgcf" generate --profile "$tmp_warp/wgcf-profile.conf"
-    )
-    run_root install -m 0600 "$tmp_warp/wgcf-profile.conf" "$wireproxy_dir/wgcf-profile.conf"
-  fi
-
-  wireproxy_conf="$tmp_warp/wireproxy.conf"
-  cat >"$wireproxy_conf" <<EOF
-WGConfig = $wireproxy_dir/wgcf-profile.conf
-
-[Socks5]
-BindAddress = $wireproxy_bind
-EOF
-  wireproxy_sha="$(file_sha256 "$wireproxy_src")"
-  wgcf_sha="$(file_sha256 "$tmp_warp/wgcf")"
-  wireproxy_manifest="$tmp_warp/skirk-managed.manifest"
-  cat >"$wireproxy_manifest" <<EOF
-# Managed by Skirk
-config_dir=$wireproxy_dir
-wireproxy_bin=$wireproxy_bin
-wireproxy_sha256=$wireproxy_sha
-wgcf_bin=$wgcf_bin
-wgcf_sha256=$wgcf_sha
-service=/etc/systemd/system/wireproxy.service
-user=$wireproxy_user
-EOF
-  run_root install -m 0755 "$tmp_warp/wgcf" "$wgcf_bin"
-  run_root install -m 0755 "$wireproxy_src" "$wireproxy_bin"
-  run_root install -m 0644 "$wireproxy_conf" "$wireproxy_dir/wireproxy.conf"
-  run_root install -m 0644 "$wireproxy_manifest" "$wireproxy_dir/skirk-managed.manifest"
-  run_root chown root:root "$wireproxy_dir" "$wireproxy_dir/wireproxy.conf" "$wireproxy_dir/skirk-managed.manifest"
-  run_root chmod 0711 "$wireproxy_dir"
-  run_root chown "$wireproxy_user" "$wireproxy_dir/wgcf-account.toml" "$wireproxy_dir/wgcf-profile.conf"
-  run_root chmod 0600 "$wireproxy_dir/wgcf-account.toml" "$wireproxy_dir/wgcf-profile.conf"
-  wireproxy_unit="$tmp_warp/wireproxy.service"
-  cat >"$wireproxy_unit" <<EOF
+set_fec_ratio() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}⚡ SET FEC RATIO${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -n "👉 Ratio (2-100): "
+    read ratio
+    
+    if [[ "$ratio" =~ ^[0-9]+$ ]] && [ "$ratio" -ge 2 ] && [ "$ratio" -le 100 ]; then
+        echo "$ratio" > "$FEC_FILE"
+        echo -e "\n${GREEN}✅ FEC set to ${ratio}:10${NC}"
+        
+        cat > /etc/systemd/system/ssh-booster.service << EOF
 [Unit]
-Description=Wireproxy WARP SOCKS proxy for Skirk exit
-# Managed by Skirk
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=exec
-User=$wireproxy_user
-ExecStart=$wireproxy_bin -c $wireproxy_dir/wireproxy.conf
-Restart=always
-RestartSec=3
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
-CapabilityBoundingSet=
-AmbientCapabilities=
-ReadOnlyPaths=$wireproxy_dir
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  if command -v systemd-analyze >/dev/null 2>&1; then
-    systemd-analyze verify "$wireproxy_unit"
-  fi
-  run_root install -m 0644 "$wireproxy_unit" /etc/systemd/system/wireproxy.service
-  run_root systemctl daemon-reload
-  run_root systemctl enable wireproxy.service
-  run_root systemctl restart wireproxy.service
-  wait_wireproxy_ready
-
-  echo "WARP wireproxy listening on $wireproxy_bind"
-}
-
-install_from_source() {
-  tmp="$1"
-  need go
-  ref="$version"
-  if [ "$ref" = "latest" ]; then
-    ref="main"
-  fi
-  url="https://github.com/$repo/archive/refs/heads/$ref.tar.gz"
-  case "$ref" in
-    v*) url="https://github.com/$repo/archive/refs/tags/$ref.tar.gz" ;;
-  esac
-
-  echo "Release asset unavailable; building from source at $url"
-  download "$url" "$tmp/source.tar.gz"
-  mkdir "$tmp/source"
-  tar -xzf "$tmp/source.tar.gz" -C "$tmp/source" --strip-components 1
-  mkdir -p "$install_dir"
-  build_out="$tmp/skirk-built"
-  (
-    cd "$tmp/source"
-    go build -trimpath -ldflags "-s -w -X main.version=$version" -o "$build_out" ./cmd/skirk
-  )
-  install_tmp="$install_dir/.skirk.tmp.$$"
-  cp "$build_out" "$install_tmp"
-  chmod 0755 "$install_tmp"
-  mv "$install_tmp" "$install_dir/skirk"
-}
-
-verify_candidate_version() {
-  binary="$1"
-  if ! is_release_version "$version"; then
-    return 0
-  fi
-  installed_output="$("$binary" version)"
-  installed="${installed_output#skirk }"
-  installed="${installed%% *}"
-  if [ "$installed" != "$version" ]; then
-    echo "error: candidate skirk reports $installed, expected $version" >&2
-    exit 1
-  fi
-}
-
-run_server_setup() {
-  if [ "$server_setup" != "1" ]; then
-    return 0
-  fi
-
-  set -- setup init --out "$setup_out"
-  if [ -n "$adc_path" ]; then
-    set -- "$@" --adc "$adc_path"
-  fi
-  if [ -n "${SKIRK_OAUTH_CLIENT_FILE:-}" ]; then
-    set -- "$@" --oauth-client-file "$SKIRK_OAUTH_CLIENT_FILE"
-  fi
-  if [ "${SKIRK_RESET_GOOGLE_LOGIN:-}" = "1" ]; then
-    set -- "$@" --reset-google-login
-  fi
-  if [ -n "${SKIRK_CLIENT_ROUTE:-}" ]; then
-    set -- "$@" --client-route "$SKIRK_CLIENT_ROUTE"
-  fi
-  if [ -n "${SKIRK_EXIT_ROUTE:-}" ]; then
-    set -- "$@" --exit-route "$SKIRK_EXIT_ROUTE"
-  fi
-  if [ -n "$exit_proxy" ]; then
-    set -- "$@" --exit-proxy "$exit_proxy"
-  fi
-
-  echo
-  echo "Running server setup..."
-  "$install_dir/skirk" "$@"
-
-  if [ "$install_systemd" = "1" ]; then
-    install_exit_service
-  fi
-}
-
-install_exit_service() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "Note: systemd is not available; start the exit manually with: $install_dir/skirk serve-exit --config $setup_out/exit.json" >&2
-    return 0
-  fi
-  if [ -z "$service_user" ]; then
-    service_user="$(id -un)"
-  fi
-  config_path="$setup_out/exit.json"
-  case "$config_path" in
-    /*) ;;
-    *) config_path="$(pwd)/$config_path" ;;
-  esac
-  service_bin="$install_dir/skirk"
-  if [ "$service_user" != "root" ]; then
-    case "$service_bin" in
-      /root|/root/*)
-        echo "error: service user $service_user cannot execute Skirk from $service_bin" >&2
-        echo "Install Skirk under /usr/local/bin or run the service as root." >&2
-        exit 1
-        ;;
-    esac
-    case "$config_path" in
-      /root|/root/*)
-        echo "error: service user $service_user cannot read Skirk config from $config_path" >&2
-        echo "Move the kit outside /root or run the service as root." >&2
-        exit 1
-        ;;
-    esac
-  fi
-  service_unit="$(normalize_service_unit "$service_name")"
-  unit="/etc/systemd/system/$service_unit"
-  if [ -e "$unit" ] && ! is_skirk_unit_file "$unit"; then
-    echo "error: refusing to overwrite non-Skirk systemd service: $unit" >&2
-    exit 1
-  fi
-  tmp_unit="$(mktemp)"
-  cat >"$tmp_unit" <<EOF
-[Unit]
-Description=Skirk exit
-# Managed by Skirk
-After=network-online.target
-Wants=network-online.target
+Description=SSH Booster - FEC ${ratio}:10
+After=network.target
 
 [Service]
 Type=simple
-User=$service_user
-WorkingDirectory=$(dirname "$config_path")
-ExecStart=$service_bin serve-exit --config $config_path
+ExecStart=/bin/bash -c 'UDPspeeder -s -l 0.0.0.0:8389 -r 127.0.0.1:22 -k "ShadowSecretKey2024" --timeout 1 -f ${ratio}:10 -q 1 2>/dev/null & sleep 2 && udp2raw -s -l 0.0.0.0:4096 -r 127.0.0.1:8389 -k "ShadowSecretKey2024" --raw-mode faketcp -a 2>/dev/null'
 Restart=always
 RestartSec=5
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  if [ "$(id -u)" -eq 0 ]; then
-    cp "$tmp_unit" "$unit"
-    remove_skirk_wireproxy_dropin "$unit.d"
-    if [ "$install_wireproxy" = "1" ]; then
-      mkdir -p "$unit.d"
-      cat >"$unit.d/10-wireproxy.conf" <<EOF
-[Unit]
-# Managed by Skirk
-After=wireproxy.service
-Wants=wireproxy.service
-EOF
+        systemctl daemon-reload
+        systemctl enable ssh-booster 2>/dev/null
+        systemctl restart ssh-booster 2>/dev/null
+    else
+        echo -e "\n${RED}❌ Invalid! Must be 2-100${NC}"
     fi
-    systemctl daemon-reload
-    systemctl enable --now "$service_unit"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo cp "$tmp_unit" "$unit"
-    remove_skirk_wireproxy_dropin "$unit.d"
-    if [ "$install_wireproxy" = "1" ]; then
-      tmp_dropin="$(mktemp)"
-      cat >"$tmp_dropin" <<EOF
-[Unit]
-# Managed by Skirk
-After=wireproxy.service
-Wants=wireproxy.service
-EOF
-      sudo mkdir -p "$unit.d"
-      sudo cp "$tmp_dropin" "$unit.d/10-wireproxy.conf"
-      rm -f "$tmp_dropin"
-    fi
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now "$service_unit"
-  else
-    echo "Note: sudo is unavailable; systemd service file was left at $tmp_unit" >&2
-    return 0
-  fi
-  rm -f "$tmp_unit"
-  echo "Installed and started systemd service: $service_unit"
+    sleep 2
 }
 
-main() {
-  parse_args "$@"
-  if [ "$dev_install" != "1" ]; then
-    repo="ShahabSL/Skirk"
-    asset_base=""
-  fi
-  if [ -z "$require_release_asset" ]; then
-    require_release_asset=1
-  fi
-  # shellcheck disable=SC2086
-  set -- $parsed_args
-  if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "--uninstall" ]; then
-    case "${1:-}" in
-      uninstall|--uninstall) shift ;;
+disable_fec() {
+    clear
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -e "${RED}🛑 DISABLE FEC${NC}"
+    echo -e "${BLUE}════════════════════════════════════════════${NC}"
+    echo -n "Confirm? (y/n): "
+    read confirm
+    
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        echo "0" > "$FEC_FILE"
+        systemctl stop ssh-booster 2>/dev/null
+        systemctl disable ssh-booster 2>/dev/null
+        echo -e "\n${GREEN}✅ FEC Disabled${NC}"
+    else
+        echo -e "\n${YELLOW}Cancelled${NC}"
+    fi
+    sleep 2
+}
+
+while true; do
+    show_menu
+    echo -n "👉 Choose [1-9]: "
+    read choice
+    case $choice in
+        1) create_user ;;
+        2) list_users ;;
+        3) show_config ;;
+        4) delete_user ;;
+        5) set_domain ;;
+        6) remove_domain ;;
+        7) set_fec_ratio ;;
+        8) disable_fec ;;
+        9) echo -e "${GREEN}👋 Goodbye!${NC}"; exit 0 ;;
+        *) echo -e "${RED}❌ Invalid${NC}"; sleep 1 ;;
     esac
-    uninstall_skirk "$@"
-    return 0
-  fi
+done
+INNEREOF
 
-  need uname
-  need tar
-  platform="$(detect_platform)"
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT INT TERM
-  preflight_wireproxy_install
+# جایگزینی placeholder با IP واقعی
+sed -i "s/SERVER_IP_PLACEHOLDER/${SERVER_IP}/g" /usr/local/bin/shadow
 
-  if [ "$wireproxy_only" = "1" ]; then
-    install_warp_wireproxy
-    return 0
-  fi
+chmod +x /usr/local/bin/shadow
 
-  if ! install_from_release "$platform" "$tmp"; then
-    if [ "$require_release_asset" = "1" ] || [ "$dev_install" != "1" ]; then
-      echo "error: release asset unavailable for $version; refusing source fallback" >&2
-      exit 1
-    fi
-    install_from_source "$tmp"
-  fi
-  install_warp_wireproxy
+# باز کردن پورت
+ufw allow 22/tcp 2>/dev/null
 
-  echo
-  "$install_dir/skirk" version
-  echo "Installed: $install_dir/skirk"
-  ensure_skirk_command
-  echo
-  echo "Next: run 'skirk' for guided setup, including easy or personal OAuth."
-  echo "Direct setup is also available: 'skirk setup init --out skirk-kit --reset-google-login'."
-
-  run_server_setup
-}
-
-main "$@"
+clear
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
+echo -e "${GREEN}✅ INSTALLATION COMPLETE!${NC}"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}📊 Features:${NC}"
+echo -e "   • Port 8388: ${RED}REMOVED${NC}"
+echo -e "   • Default Mode: ${GREEN}IP Address (${SERVER_IP})${NC}"
+echo -e "   • Option 5: ${GREEN}Set Domain${NC}"
+echo -e "   • Option 6: ${GREEN}Remove Domain (Back to IP)${NC}"
+echo -e "   • Option 7: ${GREEN}Set FEC Ratio (2-100)${NC}"
+echo -e "   • Option 8: ${RED}Disable FEC${NC}"
+echo -e "${BLUE}────────────────────────────────────────────${NC}"
+echo -e "${YELLOW}🚀 Run:${NC} ${GREEN}shadow${NC}"
+echo -e "${GREEN}════════════════════════════════════════════${NC}"
